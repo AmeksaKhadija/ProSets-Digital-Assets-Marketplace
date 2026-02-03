@@ -1,0 +1,211 @@
+// ProSets - Digital Assets Marketplace
+// Prisma Schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==================== ENUMS ====================
+
+enum UserRole {
+  BUYER
+  SELLER
+  ADMIN
+}
+
+enum AssetStatus {
+  DRAFT
+  PENDING_REVIEW
+  ACTIVE
+  INACTIVE
+  REJECTED
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+}
+
+enum AssetCategory {
+  TEMPLATES
+  GRAPHICS
+  UI_KITS
+  ICONS
+  FONTS
+  CODE_SNIPPETS
+  THEMES
+  PLUGINS
+  OTHER
+}
+
+// ==================== MODELS ====================
+
+model User {
+  id               String    @id @default(cuid())
+  auth0Id          String    @unique @map("auth0_id")
+  email            String    @unique
+  name             String?
+  avatar           String?
+  role             UserRole  @default(BUYER)
+
+  // Seller-specific fields
+  storeName        String?   @map("store_name")
+  storeDescription String?   @map("store_description") @db.Text
+
+  // Stripe Connect (for sellers)
+  stripeAccountId  String?   @unique @map("stripe_account_id")
+
+  // Timestamps
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  assets           Asset[]   @relation("SellerAssets")
+  orders           Order[]   @relation("BuyerOrders")
+  downloads        Download[]
+
+  @@map("users")
+}
+
+model Asset {
+  id              String        @id @default(cuid())
+  title           String
+  slug            String        @unique
+  description     String        @db.Text
+  longDescription String?       @map("long_description") @db.Text
+  price           Decimal       @db.Decimal(10, 2)
+  category        AssetCategory
+  tags            String[]
+  status          AssetStatus   @default(DRAFT)
+
+  // Source file (stored in private S3 bucket)
+  sourceFileKey   String        @map("source_file_key")
+  sourceFileName  String        @map("source_file_name")
+  sourceFileSize  Int           @map("source_file_size") // in bytes
+  sourceFileType  String        @map("source_file_type") // MIME type
+
+  // Preview files (stored in public S3 bucket)
+  thumbnailUrl    String        @map("thumbnail_url")
+  previewImages   String[]      @map("preview_images")
+
+  // Metadata
+  version         String        @default("1.0.0")
+  compatibility   String[]      // e.g., ["Figma", "Sketch", "Adobe XD"]
+
+  // Stats
+  downloadCount   Int           @default(0) @map("download_count")
+  salesCount      Int           @default(0) @map("sales_count")
+
+  // Timestamps
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+  publishedAt     DateTime?     @map("published_at")
+
+  // Relations
+  sellerId        String        @map("seller_id")
+  seller          User          @relation("SellerAssets", fields: [sellerId], references: [id], onDelete: Cascade)
+  orderItems      OrderItem[]
+  downloads       Download[]
+
+  @@index([sellerId])
+  @@index([category])
+  @@index([status])
+  @@index([createdAt])
+  @@index([price])
+  @@map("assets")
+}
+
+model Order {
+  id                    String      @id @default(cuid())
+  orderNumber           String      @unique @map("order_number")
+  status                OrderStatus @default(PENDING)
+
+  // Amounts (stored in cents for precision)
+  subtotal              Int         // in cents
+  platformFee           Int         @map("platform_fee") // in cents
+  total                 Int         // in cents
+  currency              String      @default("EUR")
+
+  // Stripe references
+  stripeSessionId       String?     @unique @map("stripe_session_id")
+  stripePaymentIntentId String?     @unique @map("stripe_payment_intent_id")
+
+  // Timestamps
+  createdAt             DateTime    @default(now()) @map("created_at")
+  updatedAt             DateTime    @updatedAt @map("updated_at")
+  paidAt                DateTime?   @map("paid_at")
+
+  // Relations
+  buyerId               String      @map("buyer_id")
+  buyer                 User        @relation("BuyerOrders", fields: [buyerId], references: [id], onDelete: Cascade)
+  items                 OrderItem[]
+
+  @@index([buyerId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("orders")
+}
+
+model OrderItem {
+  id           String  @id @default(cuid())
+
+  // Snapshot of asset at purchase time (for historical accuracy)
+  assetTitle   String  @map("asset_title")
+  assetPrice   Int     @map("asset_price") // in cents
+
+  // Seller payout tracking
+  sellerId     String  @map("seller_id")
+  sellerAmount Int     @map("seller_amount") // amount after platform fee, in cents
+
+  // Relations
+  orderId      String  @map("order_id")
+  order        Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  assetId      String  @map("asset_id")
+  asset        Asset   @relation(fields: [assetId], references: [id], onDelete: SetNull)
+
+  @@unique([orderId, assetId])
+  @@index([orderId])
+  @@index([assetId])
+  @@index([sellerId])
+  @@map("order_items")
+}
+
+model Download {
+  id           String   @id @default(cuid())
+
+  // Tracking info
+  ipAddress    String?  @map("ip_address")
+  userAgent    String?  @map("user_agent") @db.Text
+
+  // Timestamps
+  downloadedAt DateTime @default(now()) @map("downloaded_at")
+  expiresAt    DateTime @map("expires_at") // When the presigned URL expires
+
+  // Relations
+  userId       String   @map("user_id")
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  assetId      String   @map("asset_id")
+  asset        Asset    @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([assetId])
+  @@index([downloadedAt])
+  @@map("downloads")
+}
+
+// For Stripe webhook idempotency
+model StripeEvent {
+  id            String   @id @default(cuid())
+  stripeEventId String   @unique @map("stripe_event_id")
+  type          String
+  processedAt   DateTime @default(now()) @map("processed_at")
+
+  @@map("stripe_events")
+}
